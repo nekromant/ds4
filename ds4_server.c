@@ -667,6 +667,8 @@ typedef struct {
     bool stream_include_usage;
     int cache_read_tokens;
     int cache_write_tokens;
+    double prompt_ms;
+    double predicted_ms;
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
@@ -5569,6 +5571,20 @@ static void append_openai_usage_json(buf *b, const request *r,
                cached_tokens, cache_write_tokens);
 }
 
+static void append_timings_json(buf *b, const request *r,
+                                int prompt_tokens, int completion_tokens) {
+    double prompt_ms     = r ? r->prompt_ms     : 0.0;
+    double predicted_ms  = r ? r->predicted_ms  : 0.0;
+    double prompt_ps     = prompt_ms    > 0.0 ? (double)prompt_tokens    / (prompt_ms/1000.0)    : 0.0;
+    double predicted_ps  = predicted_ms > 0.0 ? (double)completion_tokens / (predicted_ms/1000.0) : 0.0;
+    buf_printf(b,
+               ",\"timings\":{\"prompt_n\":%d,\"predicted_n\":%d,\"cache_n\":%d,"
+               "\"prompt_ms\":%.2f,\"predicted_ms\":%.2f,"
+               "\"prompt_per_second\":%.2f,\"predicted_per_second\":%.2f}",
+               prompt_tokens, completion_tokens, r ? r->cache_read_tokens : 0,
+               prompt_ms, predicted_ms, prompt_ps, predicted_ps);
+}
+
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
@@ -5585,6 +5601,7 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
         buf_puts(&b, ",\"choices\":[],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_timings_json(&b, r, prompt_tokens, completion_tokens);
     buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len);
@@ -7483,6 +7500,7 @@ static bool final_response(int fd, bool enable_cors,
         buf_puts(&b, "}],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_timings_json(&b, r, prompt_tokens, completion_tokens);
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -12040,6 +12058,10 @@ decode_again:
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
     }
+
+    /* Expose prefill/decode wall times for llama.cpp-style timings. */
+    j->req.prompt_ms     = decode_t0 - t0;
+    j->req.predicted_ms  = now_sec() - decode_t0;
 
     if (j->req.stream) {
         bool response_ok = true;
@@ -17777,6 +17799,107 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_timings_non_stream(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.cache_read_tokens = 7;
+    r.prompt_ms = 10.0;
+    r.predicted_ms = 20.0;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    TEST_ASSERT(final_response(sv[0], false, &r, "chatcmpl_t", "Hi", NULL, NULL, "stop", 100, 50));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"usage\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"timings\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_n\":100") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_n\":50") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_n\":7") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_ms\":10.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_ms\":20.00") != NULL);
+    /* prompt_per_second = 100 / (10ms/1000) = 10000.00; predicted = 50 / (20ms/1000) = 2500.00 */
+    TEST_ASSERT(strstr(out, "\"prompt_per_second\":10000.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_per_second\":2500.00") != NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_timings_stream(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.stream_include_usage = true;
+    r.cache_read_tokens = 3;
+    r.prompt_ms = 5.0;
+    r.predicted_ms = 25.0;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_u", 10, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"usage\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"timings\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_n\":10") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_n\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_n\":3") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_per_second\":2000.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_per_second\":80.00") != NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_timings_zero_duration(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.prompt_ms = 0.0;
+    r.predicted_ms = 0.0;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    TEST_ASSERT(final_response(sv[0], false, &r, "chatcmpl_z", "Hi", NULL, NULL, "stop", 10, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"timings\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_ms\":0.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_ms\":0.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_per_second\":0.0") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_per_second\":0.0") != NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
@@ -17895,6 +18018,9 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_timings_non_stream();
+    test_timings_stream();
+    test_timings_zero_duration();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
